@@ -1,0 +1,16 @@
+feature_version: v1
+min_samples: 500
+min_symbols: 1
+min_calendar_days: 20
+min_regimes: 2
+min_folds: 2
+min_test_samples: 30
+embargo_minutes: 60
+adx_trend: 25
+adx_range: 20
+high_vol_atr_pct: "0.02"
+high_vol_realized: "0.01"
+day_horizons_bars: [3, 6, 12]
+swing_horizons_days: [1, 3, 5]
+seed: 7
+learner: lightgbm

@@ -15,5 +15,7 @@ from app.models.trading import (  # noqa: F401
     StrategyRecord,
     StrategySignalRecord,
 )
+from app.models import ai as ai_models  # noqa: F401
+from app.models import runtime as runtime_models  # noqa: F401
 
 __all__ = ["Instrument", "MarketBar"]

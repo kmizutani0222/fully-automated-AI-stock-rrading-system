@@ -14,6 +14,13 @@ class Account(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    base_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="JPY", server_default="JPY")
+    markets: Mapped[list] = mapped_column(JSON, nullable=False, default=lambda: ["US"])
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="PAUSED", server_default="PAUSED")
+    strategies: Mapped[list] = mapped_column(JSON, nullable=False, default=lambda: ["ema_cross"])
+    symbols: Mapped[list] = mapped_column(JSON, nullable=False, default=lambda: ["AAPL"])
+    risk_settings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    fallback_to_rules: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
@@ -90,6 +97,9 @@ class OrderRecord(Base):
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    execute_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reserved_cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

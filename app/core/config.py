@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     default_timeframe: str = "5m"
     csv_timezone: str = "UTC"
+    admin_token: str = "dev-admin-token"
+    runtime_autostart: bool = False
+    runtime_bar_delay_seconds: int = 30
 
 
 def assert_phase1_safety(settings: Settings) -> None:

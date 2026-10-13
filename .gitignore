@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
+data/models/
+web/node_modules/
+web/.next/

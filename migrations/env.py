@@ -7,6 +7,8 @@ from app.core.config import get_settings
 from app.db.base import Base
 from app.models import Instrument, MarketBar  # noqa: F401
 from app.models import trading as trading_models  # noqa: F401
+from app.models import ai as ai_models  # noqa: F401
+from app.models import runtime as runtime_models  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", get_settings().database_url)

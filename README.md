@@ -1,6 +1,6 @@
 # AI Trading Platform
 
-日本株と米国株を、同じデータ基盤で扱う自動売買システムです。Phase 1 は5分足の取得と品質検査、Phase 2 はルールベースのペーパートレードとバックテストです。実注文、AI、Web画面はありません。
+日本株と米国株を、同じデータ基盤で扱う自動売買システムです。Phase 1 は5分足、Phase 2 はルールベースのペーパー売買とバックテスト、Phase 3 は予測、Phase 4 は常時ペーパー運用と管理画面です。実注文はありません。
 
 取引モードは `PAPER` だけです。`LIVE_TRADING_ENABLED=true` または `TRADING_MODE=LIVE` ではプロセスが起動を拒否します。ブローカー実装は `app/broker` のシミュレーションだけで、証券会社への送信コードはありません。
 
@@ -10,7 +10,7 @@
 docker compose up -d --build
 ```
 
-API は http://localhost:8088 です。PostgreSQL はホストの `localhost:55432` に出します。コンテナ内では `db:5432` です。このマシンでは 5432 と 8000 が他のサービスで使われているため、公開ポートをずらしています。
+API は http://localhost:8088 です。管理画面は http://localhost:3088 です。PostgreSQL はホストの `localhost:55432` に出します。コンテナ内では `db:5432` です。このマシンでは 5432 と 8000 が他のサービスで使われているため、公開ポートをずらしています。
 
 ```bash
 curl http://localhost:8088/health
@@ -91,13 +91,45 @@ curl http://localhost:8088/api/v1/portfolio
 
 `POST /api/v1/backtests` は 202 と `PENDING` を返します。完了後の状態は `SUCCEEDED` または `FAILED` です。データが足りない実行は失敗となり、指標を 0 で埋めません。計算できない指標は `null` です。
 
+## Phase 3 の予測
+
+デイトレードとスイングトレードは別の LightGBM です。予測は注文になりません。戦略選択が `DAY` / `SWING` / `CASH` を決め、選ばれた場合だけ Phase 2 と同じシグナルとしてリスク管理とペーパーブローカーに渡します。
+
+学習の最低条件は `config/ai.yaml` です。サンプル数、営業日数、相場環境の数、ウォークフォワードの分割数が足りなければ学習しません。モデルも有効化しません。保存済みの AAPL 77 本はこの条件を満たさないため、学習には使いません。ルールベースのバックテストは引き続き使えます。
+
+```bash
+curl -X POST http://localhost:8088/api/v1/ai/train \
+  -H 'Content-Type: application/json' \
+  -d '{"task":"day","market":"US","symbols":["AAPL"],"start":"2026-10-12T00:00:00Z","end":"2026-10-14T00:00:00Z","provider":"yfinance"}'
+curl http://localhost:8088/api/v1/ai/training-runs/1
+curl http://localhost:8088/api/v1/ai/models
+```
+
+学習は非同期です。拒否理由は training run の `reason` に入ります。検証指標の無いモデルや失敗したモデルは有効化できません。CatBoost は差し替え用の入口だけで、この段階では学習しません。
+
+## Phase 4 の常時ペーパー運用
+
+スケジューラはアプリ起動時に動きます。5分足が確定し、到着待ちの秒数が過ぎてから処理します。同じ足は一度だけ処理し、実行中のジョブは重ねません。取得に失敗した足の価格は作りません。
+
+新規注文は次の5分足の始値で約定します。板情報はないため、スプレッドとスリッページを加えた仮想約定です。バックテストの資金とは別口座です。JPY と USD は自動換算しません。
+
+初期のペーパー口座はモード `PAUSED` です。新規注文を出すには管理画面で開始します。停止中も、既存ポジションの管理は続けます。AIモードは有効モデルが無いと新規注文を出しません。ハイブリッドでルールに戻すには、フォールバックを明示的に許可します。日本株のオンライン取得は無いので、日本株の自動売買はしません。
+
+管理画面のパスワードと API トークンは Next.js のサーバ環境変数だけが持ちます。ブラウザの JavaScript には渡しません。変更系の runtime API は `Authorization: Bearer` が必要です。
+
+```bash
+curl http://localhost:8088/api/v1/runtime/status
+curl -X POST http://localhost:8088/api/v1/runtime/pause \
+  -H "Authorization: Bearer dev-admin-token" \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":1}'
+```
+
 ## 未実装
 
-Phase 3 以降です。今回は作っていません。
-
-- AIモデルの学習、予測、戦略の自動切り替え
-- ウォークフォワードとスケジューラ
 - 証券会社API、LIVE取引、実資金の入出金
 - 信用取引、レバレッジ、空売り
-- Next.js の管理画面
-- 日本株のオンライン取得。日本株は CSV 投入だけです
+- 自動再学習スケジューラ
+- 日本株のオンライン取得。日本株は CSV のバックテストだけです
+- 相場環境の LightGBM 分類。今はルール分類で、差し替え用のインターフェースだけあります
+- CatBoost の学習

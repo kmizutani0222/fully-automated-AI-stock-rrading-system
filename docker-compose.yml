@@ -29,6 +29,9 @@ services:
       MARKET_DATA_PROVIDER: yfinance
       APP_ENV: development
       PYTHONPATH: /app
+      ADMIN_TOKEN: dev-admin-token
+      RUNTIME_AUTOSTART: "true"
+      RUNTIME_BAR_DELAY_SECONDS: "30"
     ports:
       - "8088:8000"
     volumes:
@@ -39,5 +42,24 @@ services:
     entrypoint: ["sh", "/app/docker/entrypoint.sh"]
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      API_BASE_URL: http://app:8000
+      ADMIN_TOKEN: dev-admin-token
+      ADMIN_PASSWORD: paper-admin
+      ADMIN_SESSION_SECRET: paper-session
+    ports:
+      - "3088:3000"
+    volumes:
+      - ./web:/app
+      - web_node_modules:/app/node_modules
+    command: sh -c "npm install && npx next dev --hostname 0.0.0.0 --port 3000"
+    depends_on:
+      - app
+
 volumes:
   pgdata:
+  web_node_modules:
