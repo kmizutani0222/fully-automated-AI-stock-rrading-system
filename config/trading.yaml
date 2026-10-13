@@ -1,0 +1,22 @@
+ema_fast: 9
+ema_slow: 21
+rsi_period: 14
+rsi_entry: "30"
+rsi_exit: "70"
+stop_loss_pct: "0.0075"
+take_profit_pct: null
+spread_pct: "0.0002"
+slippage_pct: "0.0005"
+commission_pct: "0"
+risk_per_trade: "0.005"
+daily_loss_pct: "0.02"
+max_drawdown_pct: "0.10"
+max_position_pct: "0.20"
+max_positions: 5
+participation_rate: "1"
+us_lot: "0.0001"
+jp_lot: "1"
+strategy_version: v1
+initial_cash:
+  JPY: "1000000"
+  USD: "0"

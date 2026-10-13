@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: asts
+      POSTGRES_PASSWORD: asts
+      POSTGRES_DB: asts
+      TZ: UTC
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asts -d asts"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command: ["postgres", "-c", "timezone=UTC"]
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://asts:asts@db:5432/asts
+      TRADING_MODE: PAPER
+      LIVE_TRADING_ENABLED: "false"
+      TRADING_ENABLED: "false"
+      MARKET_DATA_PROVIDER: yfinance
+      APP_ENV: development
+      PYTHONPATH: /app
+    ports:
+      - "8088:8000"
+    volumes:
+      - ./:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["sh", "/app/docker/entrypoint.sh"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  pgdata:

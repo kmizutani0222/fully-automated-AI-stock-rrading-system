@@ -1,0 +1,25 @@
+- market: US
+  symbol: AAPL
+  name: Apple Inc.
+  exchange: NASDAQ
+  currency: USD
+- market: US
+  symbol: MSFT
+  name: Microsoft Corp.
+  exchange: NASDAQ
+  currency: USD
+- market: US
+  symbol: NVDA
+  name: NVIDIA Corp.
+  exchange: NASDAQ
+  currency: USD
+- market: US
+  symbol: SPY
+  name: SPDR S&P 500 ETF
+  exchange: ARCA
+  currency: USD
+- market: US
+  symbol: QQQ
+  name: Invesco QQQ Trust
+  exchange: NASDAQ
+  currency: USD
