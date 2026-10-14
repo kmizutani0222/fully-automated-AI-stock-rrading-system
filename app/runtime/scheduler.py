@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.runtime.cycle import run_cycle
+from app.runtime.marketdata import StoredBarSource, collect_market_data
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,16 @@ class PaperScheduler:
 
     def run_once(self, now: datetime | None = None) -> None:
         current = now or datetime.now(timezone.utc)
+        delay = get_settings().runtime_bar_delay_seconds
         with SessionLocal() as session:
-            run_cycle(session, current, delay_seconds=get_settings().runtime_bar_delay_seconds)
+            try:
+                collect_market_data(session, current)
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("market data collection failed")
+        with SessionLocal() as session:
+            run_cycle(session, current, source=StoredBarSource(session), delay_seconds=delay)
 
     def _loop(self) -> None:
         while not self._stop.is_set():

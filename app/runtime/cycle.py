@@ -19,11 +19,12 @@ from app.data.quality import drop_open_bars, partition_bars
 from app.data.repository import ensure_instrument, get_instrument, load_bars
 from app.models import Instrument, MarketBar
 from app.models.ai import FeatureSnapshot, MarketRegime, ModelVersion, PredictionRecord, StrategyDecision
-from app.models.runtime import JobExecution, NotificationEvent, ProcessingCheckpoint, SchedulerJob, TradingSession
-from app.models.trading import Account, CashLedgerEntry, ExecutionRecord, OrderEvent, OrderRecord, PortfolioSnapshot, PositionRecord, RiskEvent
+from app.models.runtime import JobExecution, NotificationEvent, PaperExecutionObservation, ProcessingCheckpoint, SchedulerJob, TradingSession
+from app.models.trading import Account, CashLedgerEntry, ExecutionRecord, OrderEvent, OrderRecord, PortfolioSnapshot, PositionRecord, RiskEvent, StrategySignalRecord
 from app.portfolio.ledger import Portfolio, Position
 from app.risk.manager import RiskManager
 from app.runtime.accounts import cash_balances, latest_session
+from app.runtime.fills import paper_fill_quote, stop_is_valid
 from app.ai.calendar import zone_for
 from app.runtime.schedule import FILL_MODEL, bar_ready, due_bars, market_day
 from app.trading.config import load_trading_config, with_overrides
@@ -160,16 +161,20 @@ def _cycle_account(session, account: Account, now: datetime, source, delay: int)
                 raise ProviderError(str(exc)) from exc
             usable = _accept_bars(session, fetched, now)
             by_time = {bar.timestamp: bar for bar in usable if bar.symbol == symbol and bar.market == market}
-            for bar_start in pending:
-                if not bar_ready(bar_start, now, delay):
-                    break
-                bar = by_time.get(bar_start)
-                if bar is None:
+            ready = [bar_start for bar_start in pending if bar_ready(bar_start, now, delay)]
+            for bar_start in ready:
+                if by_time.get(bar_start) is None:
                     _notify(session, account.id, "ERROR", "data_missing", f"{symbol} の {bar_start.isoformat()} が無いため処理を止めました。")
                     raise ProviderError(f"missing bar {symbol} {bar_start.isoformat()}")
+            for bar_start in ready[:-1]:
+                _features(session, instruments[symbol], _history(session, instruments[symbol].id, bar_start), now)
+                _mark_checkpoint(session, account.id, market, symbol, bar_start)
+                processed.append(f"{symbol}:{bar_start.isoformat()}:backfill")
+            if ready:
+                bar_start = ready[-1]
                 history = _history(session, instruments[symbol].id, bar_start)
                 _features(session, instruments[symbol], history, now)
-                new_orders = _trade_bar(session, account, broker, portfolio, config, market, history, bar_start, instruments)
+                new_orders = _trade_bar(session, account, broker, portfolio, config, market, history, bar_start, instruments, now)
                 created_orders += new_orders
                 _mark_checkpoint(session, account.id, market, symbol, bar_start)
                 _snapshot(session, account.id, portfolio, broker, bar_start)
@@ -181,19 +186,31 @@ def _cycle_account(session, account: Account, now: datetime, source, delay: int)
     return CycleResult("SUCCEEDED", None, processed, created_orders)
 
 
-def _trade_bar(session, account, broker: SimulatedBroker, portfolio: Portfolio, config, market, history, bar_start, instruments) -> int:
+def _trade_bar(session, account, broker: SimulatedBroker, portfolio: Portfolio, config, market, history, bar_start, instruments, received_at) -> int:
     bar = history[-1]
     for order in list(broker.orders.values()):
-        if order.symbol != bar.symbol or order.execute_at != bar.timestamp:
-            continue
-        if order.execute_at is None or order.execute_at <= order.created_at:
-            broker.reject(order, "FILL_BEFORE_SIGNAL")
+        if order.symbol != bar.symbol or order.status not in {"SUBMITTED", "PARTIALLY_FILLED"}:
             continue
         if _execution_exists(session, order.idempotency_key, bar.timestamp):
             continue
-        broker.fill_market(order, bar)
-    broker.fill_limits(bar)
-    broker.protective_exit(bar.symbol, bar, bar.timestamp)
+        submitted = order.submitted_at or order.created_at
+        quote = paper_fill_quote(
+            side=order.side,
+            submitted_at=submitted,
+            bar_start=bar.timestamp,
+            open_price=bar.open,
+            close_price=bar.close,
+            received_at=received_at,
+            spread_pct=config.spread_pct,
+            slippage_pct=config.slippage_pct,
+        )
+        _observe(session, order.idempotency_key, bar.timestamp, received_at, quote)
+        if quote is None:
+            continue
+        execution = broker.fill_observed(order, bar, quote.price, quote.reference, quote.observed_at)
+        if execution is not None:
+            _notify(session, account.id, "INFO", "order_filled", f"{order.symbol} を {quote.price} で約定しました。")
+    _protect(session, account, broker, portfolio, bar, received_at)
     portfolio.mark(bar.symbol, bar.close)
     engine = _engine(session, account)
     choice = "CASH"
@@ -202,24 +219,38 @@ def _trade_bar(session, account, broker: SimulatedBroker, portfolio: Portfolio, 
         reason = _idle_reason(account, session)
     else:
         signal = _signal(session, account, engine, history, bar, instruments)
+        if signal is not None:
+            session.add(
+                StrategySignalRecord(
+                    strategy_name=_strategy_name(account, bar.symbol),
+                    instrument_id=instruments[bar.symbol].id,
+                    timestamp=bar.timestamp,
+                    signal=signal.side,
+                    reason=signal.reason,
+                )
+            )
         if signal is None:
             reason = "no_signal"
         elif signal.side == "SELL":
-            choice, reason = _submit_exit(session, account, broker, portfolio, signal, bar)
+            choice, reason = _submit_exit(session, account, broker, portfolio, signal, bar, received_at)
         elif signal.side == "BUY":
-            choice, reason = _submit_entry(session, broker, portfolio, config, market, signal, bar, account)
+            choice, reason = _submit_entry(session, broker, portfolio, config, market, signal, bar, account, received_at)
         else:
             reason = "signal_ignored"
     _decision(session, instruments[bar.symbol].id, bar.timestamp, choice, reason, engine)
     return 1 if choice in {"DAY", "RULE"} else 0
 
 
-def _submit_entry(session, broker, portfolio, config, market, signal, bar, account) -> tuple[str, str]:
+def _submit_entry(session, broker, portfolio, config, market, signal, bar, account, received_at) -> tuple[str, str]:
     if _pending_buy(broker, signal.symbol) or _open_position(portfolio, signal.symbol):
         return "CASH", "position_or_order_exists"
     key = _order_key(account.id, signal.symbol, signal.timestamp, "BUY")
     if session.scalar(select(OrderRecord.id).where(OrderRecord.idempotency_key == key)) is not None:
         return "CASH", "duplicate_order"
+    stop = bar.close * (Decimal(1) - config.stop_loss_pct)
+    if not stop_is_valid(bar.close, stop):
+        _notify(session, account.id, "WARNING", "order_rejected", "invalid_stop")
+        return "CASH", "invalid_stop"
     currency = _currency(session, signal.symbol, market)
     equity = portfolio.equity(currency)
     if equity is None:
@@ -236,11 +267,13 @@ def _submit_entry(session, broker, portfolio, config, market, signal, bar, accou
     for event in risk.events:
         session.add(RiskEvent(code=event["code"], message=event["message"], details={"account_id": account.id, **event["details"]}))
     if not decision.allowed or decision.quantity is None:
+        code = "risk_limit" if (decision.reason or "") in {"DAILY_LOSS", "HALTED"} else "order_rejected"
+        _notify(session, account.id, "WARNING", code, decision.reason or "risk_rejected")
         return "CASH", decision.reason or "risk_rejected"
     execute_at = bar.timestamp + timedelta(minutes=5)
     if execute_at <= signal.timestamp:
         return "CASH", "fill_not_after_signal"
-    broker.submit_market(
+    order = broker.submit_market(
         symbol=signal.symbol,
         side="BUY",
         quantity=decision.quantity,
@@ -250,10 +283,17 @@ def _submit_entry(session, broker, portfolio, config, market, signal, bar, accou
         reserve_price=bar.close,
         created_at=signal.timestamp,
     )
+    order.submitted_at = received_at
+    order.signal_generated_at = received_at
+    order.bar_close_time = bar.timestamp + timedelta(minutes=5)
+    order.data_received_at = received_at
+    order.strategy_name = _strategy_name(account, signal.symbol)
+    order.decision_reason = signal.reason
+    _notify(session, account.id, "INFO", "order_submitted", f"{signal.symbol} の買いを送信しました。")
     return "RULE" if account.mode == "RULE_BASED" else "DAY", signal.reason
 
 
-def _submit_exit(session, account, broker, portfolio, signal, bar) -> tuple[str, str]:
+def _submit_exit(session, account, broker, portfolio, signal, bar, received_at) -> tuple[str, str]:
     position = portfolio.positions.get(signal.symbol)
     if position is None or not position.is_open:
         return "CASH", "no_open_position"
@@ -261,7 +301,7 @@ def _submit_exit(session, account, broker, portfolio, signal, bar) -> tuple[str,
     if broker._by_key.get(key) is not None or session.scalar(select(OrderRecord.id).where(OrderRecord.idempotency_key == key)) is not None:
         return "CASH", "duplicate_order"
     execute_at = bar.timestamp + timedelta(minutes=5)
-    broker.submit_market(
+    order = broker.submit_market(
         symbol=signal.symbol,
         side="SELL",
         quantity=position.quantity,
@@ -271,12 +311,47 @@ def _submit_exit(session, account, broker, portfolio, signal, bar) -> tuple[str,
         reserve_price=bar.close,
         created_at=signal.timestamp,
     )
+    order.submitted_at = received_at
+    order.signal_generated_at = received_at
+    order.bar_close_time = bar.timestamp + timedelta(minutes=5)
+    order.data_received_at = received_at
+    order.strategy_name = _strategy_name(account, signal.symbol)
+    order.decision_reason = signal.reason
+    _notify(session, account.id, "INFO", "order_submitted", f"{signal.symbol} の売りを送信しました。")
     return "CASH", signal.reason
+
+
+def _protect(session, account, broker, portfolio, bar, received_at) -> None:
+    position = portfolio.positions.get(bar.symbol)
+    if position is None or not position.is_open:
+        return
+    if _pending_sell(broker, bar.symbol):
+        return
+    hit_stop = position.stop_price is not None and bar.low <= position.stop_price
+    hit_target = position.take_profit is not None and bar.high >= position.take_profit
+    if not hit_stop and not hit_target:
+        return
+    from app.trading.strategies import Signal
+
+    reason = "stop_loss" if hit_stop else "take_profit"
+    signal = Signal(bar.symbol, bar.timestamp, "SELL", reason)
+    _submit_exit(session, account, broker, portfolio, signal, bar, received_at)
+
+
+def _strategy_name(account, symbol: str) -> str:
+    mapping = account.symbol_strategies or {}
+    if isinstance(mapping, dict) and mapping.get(symbol):
+        return str(mapping[symbol])
+    names = [str(item) for item in (account.strategies or [])]
+    return names[0] if names else "ema_cross"
 
 
 def _signal(session, account, engine, history, bar, instruments):
     if engine == "rules":
-        name = (account.strategies or ["ema_cross"])[0]
+        name = _strategy_name(account, bar.symbol)
+        enabled = {str(item) for item in (account.strategies or [])}
+        if name not in enabled:
+            return None
         strategy = build_strategy(name, with_overrides(load_trading_config(), account.risk_settings or {}))
         return strategy.evaluate(history)
     predictions = session.scalars(
@@ -369,6 +444,8 @@ def _load_book(session, account, config) -> tuple[SimulatedBroker, Portfolio]:
             quantity=row.quantity,
             average_price=row.average_price,
             realized_pnl=row.realized_pnl,
+            stop_price=row.stop_price,
+            take_profit=row.take_profit,
             opened_at=row.opened_at,
         )
     broker = SimulatedBroker(portfolio, config)
@@ -394,6 +471,12 @@ def _load_book(session, account, config) -> tuple[SimulatedBroker, Portfolio]:
             limit_price=row.limit_price,
             execute_at=row.execute_at,
             reserved=row.reserved_cash or Decimal(0),
+            submitted_at=row.submitted_at,
+            signal_generated_at=row.signal_generated_at,
+            bar_close_time=row.bar_close_time,
+            data_received_at=row.data_received_at,
+            strategy_name=row.strategy_name,
+            decision_reason=row.decision_reason,
         )
         broker.orders[order.id] = order
         broker._by_key[order.idempotency_key] = order
@@ -424,6 +507,12 @@ def _sync(session, account, broker: SimulatedBroker, instruments, now: datetime)
                 reserved_cash=order.reserved,
                 created_at=order.created_at,
                 updated_at=now,
+                submitted_at=order.submitted_at,
+                signal_generated_at=order.signal_generated_at,
+                bar_close_time=order.bar_close_time,
+                data_received_at=order.data_received_at,
+                strategy_name=order.strategy_name,
+                decision_reason=order.decision_reason,
             )
             session.add(row)
             session.flush()
@@ -434,6 +523,7 @@ def _sync(session, account, broker: SimulatedBroker, instruments, now: datetime)
             row.status = order.status
             row.reserved_cash = order.reserved
             row.execute_at = order.execute_at
+            row.submitted_at = order.submitted_at
             row.updated_at = now
         id_map[order.id] = row.id
     for execution in broker.executions:
@@ -453,6 +543,8 @@ def _sync(session, account, broker: SimulatedBroker, instruments, now: datetime)
                 slippage_cost=execution.slippage_cost,
                 spread_cost=execution.spread_cost,
                 executed_at=execution.executed_at,
+                fill_observed_at=execution.fill_observed_at,
+                filled_at=execution.filled_at or execution.fill_observed_at,
             )
         )
     for entry in broker.portfolio.ledger:
@@ -489,17 +581,23 @@ def _sync(session, account, broker: SimulatedBroker, instruments, now: datetime)
                         realized_pnl=position.realized_pnl,
                         status="OPEN",
                         opened_at=position.opened_at,
+                        stop_price=position.stop_price,
+                        take_profit=position.take_profit,
                     )
                 )
             else:
                 row.quantity = position.quantity
                 row.average_price = position.average_price
                 row.realized_pnl = position.realized_pnl
+                row.stop_price = position.stop_price
+                row.take_profit = position.take_profit
         elif row is not None:
             row.quantity = Decimal(0)
             row.status = "CLOSED"
             row.closed_at = position.closed_at
             row.realized_pnl = position.realized_pnl
+            row.stop_price = None
+            row.take_profit = None
 
 
 def _reconcile(session, account_id: int, portfolio: Portfolio) -> None:
@@ -635,6 +733,9 @@ def _snapshot(session, account_id: int, portfolio: Portfolio, broker: SimulatedB
                 drawdown=drawdown,
             )
         )
+        from app.runtime.performance import refresh_daily
+
+        refresh_daily(session, account_id, currency, timestamp, equity)
 
 
 def _peak(session, account_id, currency, equity) -> Decimal | None:
@@ -736,18 +837,41 @@ def _ensure_session(session, account, now: datetime) -> None:
 
 
 def _notify(session, account_id: int | None, level: str, code: str, message: str) -> None:
-    if level == "INFO":
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
-        existing = session.scalar(
-            select(NotificationEvent.id).where(
-                NotificationEvent.account_id == account_id,
-                NotificationEvent.code == code,
-                NotificationEvent.created_at >= cutoff,
-            )
+    try:
+        with session.begin_nested():
+            if level == "INFO":
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+                existing = session.scalar(
+                    select(NotificationEvent.id).where(
+                        NotificationEvent.account_id == account_id,
+                        NotificationEvent.code == code,
+                        NotificationEvent.created_at >= cutoff,
+                    )
+                )
+                if existing is not None:
+                    return
+            session.add(NotificationEvent(account_id=account_id, level=level, code=code, message=message))
+    except Exception:
+        return
+
+
+def _observe(session, idempotency_key: str, bar_timestamp: datetime, received_at: datetime, quote) -> None:
+    row = session.scalar(select(OrderRecord).where(OrderRecord.idempotency_key == idempotency_key))
+    if row is None:
+        return
+    session.add(
+        PaperExecutionObservation(
+            order_id=row.id,
+            bar_timestamp=bar_timestamp,
+            received_at=received_at,
+            observed_at=None if quote is None else quote.observed_at,
+            source="none" if quote is None else quote.source,
+            reference_price=None if quote is None else quote.reference,
+            fill_price=None if quote is None else quote.price,
+            accepted=quote is not None,
+            reason="price_not_after_submission" if quote is None else quote.source,
         )
-        if existing is not None:
-            return
-    session.add(NotificationEvent(account_id=account_id, level=level, code=code, message=message))
+    )
 
 
 def _record_failure(account_name: str, message: str, job_name: str = JOB_NAME) -> None:
@@ -788,6 +912,10 @@ def _execution_exists(session, idempotency_key: str, timestamp: datetime) -> boo
 
 def _pending_buy(broker: SimulatedBroker, symbol: str) -> bool:
     return any(order.symbol == symbol and order.side == "BUY" and order.status in OPEN_ORDER_STATUSES for order in broker.orders.values())
+
+
+def _pending_sell(broker: SimulatedBroker, symbol: str) -> bool:
+    return any(order.symbol == symbol and order.side == "SELL" and order.status in OPEN_ORDER_STATUSES for order in broker.orders.values())
 
 
 def _open_position(portfolio: Portfolio, symbol: str) -> bool:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,7 @@ from app.models.runtime import AuditLog, JobExecution, NotificationEvent, Schedu
 from app.models.trading import Account, CashLedgerEntry, ExecutionRecord, OrderRecord, PortfolioSnapshot, PositionRecord
 from app.runtime.accounts import MODES, cash_balances, create_account, latest_session, post_cash
 from app.runtime.auth import require_admin, write_audit
+from app.runtime.mode_history import record_mode_change
 from app.runtime.schedule import FILL_MODEL
 from app.schemas.runtime import AccountIn, AccountSettingsIn, CashIn, RuntimeCommand
 from app.trading.strategies import strategy_names
@@ -76,17 +77,33 @@ def runtime_status(db: Session = Depends(get_session)) -> dict:
 
 
 @router.post("/runtime/start")
-def runtime_start(payload: RuntimeCommand, actor: str = Depends(require_admin), db: Session = Depends(get_session)) -> dict:
+def runtime_start(
+    payload: RuntimeCommand,
+    actor: str = Depends(require_admin),
+    db: Session = Depends(get_session),
+    request_id: str | None = Header(default=None, alias="X-Request-Id"),
+) -> dict:
     assert_phase1_safety(get_settings())
     if payload.mode and payload.mode.upper() == "LIVE":
         raise HTTPException(status_code=400, detail="LIVE mode is not implemented")
     account = _paper_account(db, payload.account_id)
+    previous_mode = account.mode
     mode = (payload.mode or account.mode or "RULE_BASED").upper()
     if mode == "PAUSED":
         mode = "RULE_BASED"
     if mode not in MODES:
         raise HTTPException(status_code=400, detail="unsupported mode")
     account.mode = mode
+    record_mode_change(
+        db,
+        account_id=account.id,
+        previous_mode=previous_mode,
+        new_mode=mode,
+        actor=actor,
+        action="runtime_start",
+        request_id=request_id,
+        reason="operator_start",
+    )
     trading = latest_session(db, account.id)
     now = datetime.now(timezone.utc)
     if trading is None:
@@ -111,12 +128,28 @@ def runtime_start(payload: RuntimeCommand, actor: str = Depends(require_admin), 
 
 
 @router.post("/runtime/pause")
-def runtime_pause(payload: RuntimeCommand, actor: str = Depends(require_admin), db: Session = Depends(get_session)) -> dict:
+def runtime_pause(
+    payload: RuntimeCommand,
+    actor: str = Depends(require_admin),
+    db: Session = Depends(get_session),
+    request_id: str | None = Header(default=None, alias="X-Request-Id"),
+) -> dict:
     account = _paper_account(db, payload.account_id)
     now = datetime.now(timezone.utc)
     trading = latest_session(db, account.id)
+    previous_mode = account.mode
     previous = account.mode if account.mode != "PAUSED" else (trading.resume_mode if trading else "RULE_BASED")
     account.mode = "PAUSED"
+    record_mode_change(
+        db,
+        account_id=account.id,
+        previous_mode=previous_mode,
+        new_mode="PAUSED",
+        actor=actor,
+        action="runtime_pause",
+        request_id=request_id,
+        reason="operator_pause",
+    )
     if trading is None:
         trading = TradingSession(
             account_id=account.id,
@@ -134,19 +167,38 @@ def runtime_pause(payload: RuntimeCommand, actor: str = Depends(require_admin), 
         trading.resume_mode = previous
         trading.updated_at = now
     write_audit(db, actor, "runtime_pause", "/api/v1/runtime/pause", {"account_id": account.id})
+    from app.runtime.cycle import _notify
+
+    _notify(db, account.id, "WARNING", "trading_halted", "新規買いは停止しました。保有の決済とリスク管理は続けます。")
     db.commit()
     return {"account_id": account.id, "mode": "PAUSED", "resume_mode": previous}
 
 
 @router.post("/runtime/resume")
-def runtime_resume(payload: RuntimeCommand, actor: str = Depends(require_admin), db: Session = Depends(get_session)) -> dict:
+def runtime_resume(
+    payload: RuntimeCommand,
+    actor: str = Depends(require_admin),
+    db: Session = Depends(get_session),
+    request_id: str | None = Header(default=None, alias="X-Request-Id"),
+) -> dict:
     assert_phase1_safety(get_settings())
     account = _paper_account(db, payload.account_id)
     trading = latest_session(db, account.id)
+    previous_mode = account.mode
     mode = trading.resume_mode if trading and trading.resume_mode else "RULE_BASED"
     if mode == "PAUSED":
         mode = "RULE_BASED"
     account.mode = mode
+    record_mode_change(
+        db,
+        account_id=account.id,
+        previous_mode=previous_mode,
+        new_mode=mode,
+        actor=actor,
+        action="runtime_resume",
+        request_id=request_id,
+        reason="operator_resume",
+    )
     now = datetime.now(timezone.utc)
     if trading is None:
         trading = TradingSession(
@@ -251,15 +303,27 @@ def account_settings(
     payload: AccountSettingsIn,
     actor: str = Depends(require_admin),
     db: Session = Depends(get_session),
+    request_id: str | None = Header(default=None, alias="X-Request-Id"),
 ) -> dict:
     account = db.get(Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="account not found")
+    previous_mode = account.mode
     if payload.mode is not None:
         mode = payload.mode.upper()
         if mode == "LIVE" or mode not in MODES:
             raise HTTPException(status_code=400, detail="unsupported mode")
         account.mode = mode
+        record_mode_change(
+            db,
+            account_id=account.id,
+            previous_mode=previous_mode,
+            new_mode=mode,
+            actor=actor,
+            action="update_account",
+            request_id=request_id,
+            reason="account_settings",
+        )
     if payload.markets is not None:
         account.markets = [item.upper() for item in payload.markets]
     if payload.strategies is not None:

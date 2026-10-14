@@ -24,6 +24,8 @@ class Execution:
     realized_pnl: Decimal | None
     executed_at: datetime
     signal_time: datetime
+    fill_observed_at: datetime | None = None
+    filled_at: datetime | None = None
 
 
 @dataclass
@@ -42,6 +44,12 @@ class BrokerOrder:
     execute_at: datetime | None = None
     reserved: Decimal = Decimal(0)
     events: list[str] = field(default_factory=list)
+    submitted_at: datetime | None = None
+    signal_generated_at: datetime | None = None
+    bar_close_time: datetime | None = None
+    data_received_at: datetime | None = None
+    strategy_name: str | None = None
+    decision_reason: str | None = None
 
     @property
     def remaining(self) -> Decimal:
@@ -138,6 +146,19 @@ class SimulatedBroker:
         if order.execute_at != bar.timestamp:
             return None
         return self._fill(order, bar, self._market_price(order.side, bar.open), bar.open)
+
+    def fill_observed(self, order: BrokerOrder, bar: PriceBar, price: Decimal, reference: Decimal, observed_at: datetime) -> Execution | None:
+        """Paper fill. The caller must pass a price observed after submission. Backtests keep fill_market."""
+        submitted = order.submitted_at or order.created_at
+        if observed_at <= submitted:
+            return None
+        if order.status not in {"SUBMITTED", "PARTIALLY_FILLED"}:
+            return None
+        execution = self._fill(order, bar, price, reference)
+        if execution is not None:
+            execution.fill_observed_at = observed_at
+            execution.filled_at = observed_at
+        return execution
 
     def fill_limits(self, bar: PriceBar) -> list[Execution]:
         fills: list[Execution] = []

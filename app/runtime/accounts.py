@@ -50,6 +50,7 @@ def create_account(
         symbols=symbols,
         risk_settings=risk_settings,
         fallback_to_rules=fallback_to_rules,
+        symbol_strategies={},
     )
     session.add(account)
     session.flush()
@@ -71,13 +72,17 @@ def create_account(
     return account
 
 
-def post_cash(session: Session, account: Account, currency: str, amount: Decimal, reason: str) -> CashLedgerEntry:
+def post_cash(session: Session, account: Account, currency: str, amount: Decimal, reason: str, idempotency_key: str | None = None) -> CashLedgerEntry:
     if currency not in {"JPY", "USD"}:
         raise ValueError("currency must be JPY or USD")
     if reason not in {"DEPOSIT", "WITHDRAWAL"}:
         raise ValueError("cash changes are deposit or withdrawal events")
     if amount <= 0:
         raise ValueError("amount must be positive")
+    if idempotency_key:
+        existing = session.scalar(select(CashLedgerEntry).where(CashLedgerEntry.idempotency_key == idempotency_key))
+        if existing is not None:
+            return existing
     balances = cash_balances(session, account.id)
     current = balances.get(currency, Decimal(0))
     if reason == "WITHDRAWAL" and current < amount:
@@ -89,6 +94,7 @@ def post_cash(session: Session, account: Account, currency: str, amount: Decimal
         amount=signed,
         balance_after=current + signed,
         reason=reason,
+        idempotency_key=idempotency_key,
     )
     session.add(entry)
     session.flush()

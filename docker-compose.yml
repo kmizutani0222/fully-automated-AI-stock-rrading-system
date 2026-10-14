@@ -10,6 +10,7 @@ services:
       - "55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U asts -d asts"]
       interval: 5s
@@ -17,12 +18,23 @@ services:
       retries: 20
     command: ["postgres", "-c", "timezone=UTC"]
 
+  test-database:
+    image: postgres:16
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - ./docker/postgres/ensure-test-db.sh:/ensure-test-db.sh:ro
+    entrypoint: ["sh", "/ensure-test-db.sh"]
+
   app:
     build:
       context: .
       dockerfile: docker/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg://asts:asts@db:5432/asts
+      TEST_DATABASE_URL: postgresql+psycopg://asts:asts@db:5432/asts_test
       TRADING_MODE: PAPER
       LIVE_TRADING_ENABLED: "false"
       TRADING_ENABLED: "false"
@@ -39,6 +51,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      test-database:
+        condition: service_completed_successfully
     entrypoint: ["sh", "/app/docker/entrypoint.sh"]
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 

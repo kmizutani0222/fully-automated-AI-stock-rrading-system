@@ -1,6 +1,6 @@
 # AI Trading Platform
 
-日本株と米国株を、同じデータ基盤で扱う自動売買システムです。Phase 1 は5分足、Phase 2 はルールベースのペーパー売買とバックテスト、Phase 3 は予測、Phase 4 は常時ペーパー運用と管理画面です。実注文はありません。
+日本株と米国株を、同じデータ基盤で扱う自動売買システムです。Phase 1 は5分足、Phase 2 はルールベースのペーパー売買とバックテスト、Phase 3 は予測、Phase 4 は常時ペーパー運用と管理画面、Phase 5A は約定時刻と米国株ペーパーの検証、Phase 5A-2 は検証口座と運用監査です。実注文はありません。
 
 取引モードは `PAPER` だけです。`LIVE_TRADING_ENABLED=true` または `TRADING_MODE=LIVE` ではプロセスが起動を拒否します。ブローカー実装は `app/broker` のシミュレーションだけで、証券会社への送信コードはありません。
 
@@ -22,6 +22,8 @@ curl http://localhost:8088/instruments
 ## 環境変数
 
 `.env.example` を `.env` にコピーして使います。Compose 内のアプリは `docker-compose.yml` の `DATABASE_URL` を使うので、コンテナ起動自体に `.env` は不要です。
+
+運用データベースは `asts`、pytest 専用は `asts_test` です。同じ PostgreSQL インスタンスに分けてあり、公開ポートは `55432` のままです。アプリの起動は `asts` だけをマイグレーションし、`asts_test` では起動しません。
 
 `LIVE_TRADING_ENABLED=true` または `TRADING_MODE=LIVE` ではプロセスが起動を拒否します。実売買ブローカーは実装していません。
 
@@ -66,7 +68,7 @@ docker compose exec app python scripts/collect_us_bars.py --symbols AAPL --days 
 docker compose exec app pytest -q
 ```
 
-PostgreSQL が無い環境では、データベースを使うテストだけスキップします。
+pytest は `TEST_DATABASE_URL` の `asts_test` にだけ接続します。この変数が無いとき、または運用DB `asts` と同じデータベースを指すときは、テーブルを開く前に終了コード 2 で拒否します。PostgreSQL が無い環境では、データベースを使うテストだけスキップします。
 
 ## Phase 2 のバックテスト
 
@@ -111,7 +113,7 @@ curl http://localhost:8088/api/v1/ai/models
 
 スケジューラはアプリ起動時に動きます。5分足が確定し、到着待ちの秒数が過ぎてから処理します。同じ足は一度だけ処理し、実行中のジョブは重ねません。取得に失敗した足の価格は作りません。
 
-新規注文は次の5分足の始値で約定します。板情報はないため、スプレッドとスリッページを加えた仮想約定です。バックテストの資金とは別口座です。JPY と USD は自動換算しません。
+バックテストの新規注文は次の5分足の始値で約定します。リアルタイムのペーパー取引は、注文を送ったあとで観測した価格だけを使います。次足の始値が送信より前なら使いません。板が無いときは、その後に確定した終値へスプレッドとスリッページを加えます。価格が取れなければ未約定のままです。バックテストの資金とは別口座です。JPY と USD は自動換算しません。
 
 初期のペーパー口座はモード `PAUSED` です。新規注文を出すには管理画面で開始します。停止中も、既存ポジションの管理は続けます。AIモードは有効モデルが無いと新規注文を出しません。ハイブリッドでルールに戻すには、フォールバックを明示的に許可します。日本株のオンライン取得は無いので、日本株の自動売買はしません。
 
@@ -123,6 +125,38 @@ curl -X POST http://localhost:8088/api/v1/runtime/pause \
   -H "Authorization: Bearer dev-admin-token" \
   -H "Content-Type: application/json" \
   -d '{"account_id":1}'
+```
+
+## Phase 5A の約定とデータ品質
+
+米国株の取得と売買は分かれています。取得に失敗しても価格は作らず、欠損と失敗を記録します。過去足の補完は保存とチェックポイントだけで、その足から新規注文は出しません。
+
+USD の仮想入金は管理者が `Idempotency-Key` 付きで明示したときだけです。同じキーは一度だけ記帳します。残高行は直接更新しません。既存の JPY 残高は入金対象の通貨が USD なら変わりません。
+
+```bash
+curl -X POST http://localhost:8088/api/v1/paper/deposits \
+  -H "Authorization: Bearer dev-admin-token" \
+  -H "Idempotency-Key: deposit-usd-1" \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":1,"currency":"USD","amount":"10000"}'
+curl http://localhost:8088/api/v1/paper/status
+curl http://localhost:8088/api/v1/market-data/health
+curl http://localhost:8088/api/v1/paper/performance
+```
+
+初期のペーパー口座へは自動入金しません。管理画面のペーパー運用、データ品質、成績から状態を確認します。計算できない指標は空欄です。
+
+## Phase 5A-2 の検証と監査
+
+運用口座 `paper` の銘柄、戦略、資金、リスク、モードはそのままです。注文から決済までの検証はテストデータベース `asts_test` の別口座で行い、その損益は運用成績に入れません。
+
+モード変更は `account_mode_changes` へ追記します。`trading_sessions` を更新しても、過去の変更行は残り続けます。
+
+日次レポートは運用口座 `paper` だけです。注文が0件の日は件数を0とし、収益性は評価済みにしません。
+
+```bash
+curl http://localhost:8088/api/v1/paper/status
+curl http://localhost:8088/api/v1/paper/daily-report
 ```
 
 ## 未実装

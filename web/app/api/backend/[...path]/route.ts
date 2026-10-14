@@ -12,6 +12,10 @@ async function forward(request: NextRequest, path: string[]) {
   if (request.headers.get("content-type")) {
     headers.set("content-type", request.headers.get("content-type") || "application/json");
   }
+  const idempotency = request.headers.get("idempotency-key");
+  if (idempotency) {
+    headers.set("idempotency-key", idempotency);
+  }
   const init: RequestInit = { method: request.method, headers };
   if (request.method !== "GET" && request.method !== "HEAD") {
     init.body = await request.text();

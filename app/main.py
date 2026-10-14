@@ -12,6 +12,7 @@ from app.api.market import router as market_router
 from app.api.v1_routes import router as v1_router
 from app.api.ai_routes import router as ai_router
 from app.api.runtime_routes import router as runtime_router
+from app.api.paper_routes import router as paper_router
 from app.core.config import get_settings
 from app.core.logging import setup_logging
 from app.runtime.scheduler import start_scheduler, stop_scheduler
@@ -36,13 +37,14 @@ app.include_router(import_router)
 app.include_router(v1_router)
 app.include_router(ai_router)
 app.include_router(runtime_router)
+app.include_router(paper_router)
 
 
 @app.get("/")
 def root() -> dict:
     return {
         "service": "AI Trading Platform",
-        "phase": 4,
+        "phase": "5A-2",
         "trading_mode": settings.trading_mode,
         "live_trading_enabled": False,
         "docs": "/docs",

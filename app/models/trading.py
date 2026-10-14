@@ -21,6 +21,7 @@ class Account(Base):
     symbols: Mapped[list] = mapped_column(JSON, nullable=False, default=lambda: ["AAPL"])
     risk_settings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     fallback_to_rules: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    symbol_strategies: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
@@ -100,6 +101,12 @@ class OrderRecord(Base):
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
     execute_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reserved_cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    signal_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bar_close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    data_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    strategy_name: Mapped[str | None] = mapped_column(String(50))
+    decision_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -127,6 +134,8 @@ class ExecutionRecord(Base):
     slippage_cost: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     spread_cost: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fill_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BacktestTrade(Base):
@@ -161,6 +170,8 @@ class PositionRecord(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stop_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    take_profit: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
 
 
 class CashLedgerEntry(Base):
@@ -173,6 +184,7 @@ class CashLedgerEntry(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     balance_after: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     reason: Mapped[str] = mapped_column(String(50), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
