@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 
 @dataclass
@@ -22,6 +22,14 @@ class Position:
         return self.quantity > 0
 
 
+MONEY_QUANTUM = Decimal("0.00000001")
+
+
+def money(value: Decimal) -> Decimal:
+    """Round to numeric(20, 8). PostgreSQL rounds half away from zero."""
+    return Decimal(value).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
 @dataclass
 class LedgerEntry:
     currency: str
@@ -29,6 +37,7 @@ class LedgerEntry:
     balance_after: Decimal
     reason: str
     created_at: datetime
+    idempotency_key: str | None = None
 
 
 @dataclass
@@ -98,10 +107,10 @@ class Portfolio:
         stop_price: Decimal | None,
         take_profit: Decimal | None,
     ) -> None:
-        cost = price * quantity + commission
+        cost = money(price * quantity + commission)
         if self.cash.get(currency, Decimal(0)) < cost:
             raise ValueError("insufficient cash")
-        self.cash[currency] = self.cash.get(currency, Decimal(0)) - cost
+        self.cash[currency] = money(self.cash.get(currency, Decimal(0)) - cost)
         self.ledger.append(LedgerEntry(currency, -cost, self.cash[currency], "BUY", filled_at))
         average_fill = (price * quantity + commission) / quantity
         position = self.positions.get(symbol)
@@ -133,9 +142,9 @@ class Portfolio:
         position = self.positions.get(symbol)
         if position is None or position.quantity < quantity:
             raise ValueError("short selling is not enabled")
-        proceeds = price * quantity - commission
-        realized = (price - position.average_price) * quantity - commission
-        self.cash[position.currency] = self.cash.get(position.currency, Decimal(0)) + proceeds
+        proceeds = money(price * quantity - commission)
+        realized = money((price - position.average_price) * quantity - commission)
+        self.cash[position.currency] = money(self.cash.get(position.currency, Decimal(0)) + proceeds)
         self.ledger.append(LedgerEntry(position.currency, proceeds, self.cash[position.currency], "SELL", filled_at))
         position.realized_pnl += realized
         position.quantity -= quantity

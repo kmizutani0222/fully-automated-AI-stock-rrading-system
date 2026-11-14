@@ -241,6 +241,8 @@ class SimulatedBroker:
         order.events.append(order.status)
         sequence = self._sequences.get(order.id, 0) + 1
         self._sequences[order.id] = sequence
+        if self.portfolio.ledger:
+            self.portfolio.ledger[-1].idempotency_key = f"{order.idempotency_key}:fill:{sequence}"
         slippage = abs(price - reference) * quantity
         spread = reference * self.config.spread_pct / Decimal(2) * quantity
         execution = Execution(
