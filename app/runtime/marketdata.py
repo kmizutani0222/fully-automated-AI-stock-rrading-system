@@ -12,11 +12,11 @@ from app.data.quality import inspect_bars
 from app.data.repository import get_instrument, load_bars
 from app.models.runtime import MarketDataHealth, ProcessingCheckpoint
 from app.models.trading import Account
-from app.runtime.cycle import YFinanceSource, _accept_bars
+from app.runtime.cycle import YFinanceSource, _accept_bars, pending_expected
 from app.runtime.schedule import bar_ready, market_day
 
 
-def collect_market_data(session: Session, now: datetime, *, source=None, symbols: list[tuple[str, str]] | None = None, attempts: int = 3) -> list[MarketDataHealth]:
+def collect_market_data(session: Session, now: datetime, *, source=None, symbols: list[tuple[str, str]] | None = None, attempts: int = 3, account_name: str = "paper") -> list[MarketDataHealth]:
     """Fetch closed US bars and store health. This path does not create orders."""
     current = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
     feed = source or YFinanceSource()
@@ -26,13 +26,20 @@ def collect_market_data(session: Session, now: datetime, *, source=None, symbols
         if market != "US":
             rows.append(_health(session, market, symbol, "disabled", current, None, 0, 0, "日本株のオンライン取得はありません。"))
             continue
-        if not is_trading_day(market, market_day(market, current)):
-            rows.append(_health(session, market, symbol, "closed", current, None, 0, 0, "休場日です。"))
-            continue
         delay = get_settings().runtime_bar_delay_seconds
-        due = [start for start in session_bar_starts(market, market_day(market, current)) if bar_ready(start, current, delay)]
+        trading_day = is_trading_day(market, market_day(market, current))
+        last = _checkpoint_after(session, market, symbol, account_name)
+        if last is not None:
+            due = pending_expected(market, last, current, delay)
+        elif trading_day:
+            due = [start for start in session_bar_starts(market, market_day(market, current)) if bar_ready(start, current, delay)]
+        else:
+            due = []
         if not due:
-            rows.append(_health(session, market, symbol, "waiting", current, None, 0, 0, "確定した足はまだありません。"))
+            if not trading_day:
+                rows.append(_health(session, market, symbol, "closed", current, None, 0, 0, "休場日です。"))
+            else:
+                rows.append(_health(session, market, symbol, "waiting", current, None, 0, 0, "確定した足はまだありません。"))
             continue
         start = due[0]
         end = due[-1] + timedelta(minutes=5)
@@ -130,6 +137,19 @@ def gap_rows(session: Session, market: str, symbol: str) -> list[dict]:
             missing.append({"symbol": symbol, "timestamp": cursor})
             cursor += timedelta(minutes=5)
     return missing
+
+
+def _checkpoint_after(session: Session, market: str, symbol: str, account_name: str) -> datetime | None:
+    account = session.scalar(select(Account).where(Account.name == account_name))
+    if account is None:
+        return None
+    return session.scalar(
+        select(func.max(ProcessingCheckpoint.bar_timestamp)).where(
+            ProcessingCheckpoint.account_id == account.id,
+            ProcessingCheckpoint.market == market,
+            ProcessingCheckpoint.symbol == symbol,
+        )
+    )
 
 
 def _us_symbols(session: Session) -> list[tuple[str, str]]:

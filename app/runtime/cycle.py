@@ -25,7 +25,7 @@ from app.portfolio.ledger import Portfolio, Position
 from app.risk.manager import RiskManager
 from app.runtime.accounts import cash_balances, latest_session
 from app.runtime.fills import paper_fill_quote, stop_is_valid
-from app.ai.calendar import zone_for
+from app.ai.calendar import session_bar_starts, zone_for
 from app.runtime.schedule import FILL_MODEL, bar_ready, due_bars, market_day
 from app.trading.config import load_trading_config, with_overrides
 from app.trading.strategies import PriceBar, build_strategy
@@ -66,6 +66,25 @@ class YFinanceSource:
 
         provider = YFinanceUsProvider()
         return asyncio.run(provider.get_bars(symbol, "5m", start, end))
+
+
+def pending_expected(market: str, after: datetime, now: datetime, delay_seconds: int) -> list[datetime]:
+    """Closed session bars after `after`.
+
+    Weekends, holidays, and the time after an early close are not expected bars,
+    so they are not treated as gaps.
+    """
+    zone = zone_for(market)
+    start_day = _aware(after).astimezone(zone).date()
+    end_day = _aware(now).astimezone(zone).date()
+    found: list[datetime] = []
+    day = start_day
+    while day <= end_day:
+        for start in session_bar_starts(market, day):
+            if start > _aware(after) and bar_ready(start, now, delay_seconds):
+                found.append(start)
+        day += timedelta(days=1)
+    return found
 
 
 def run_cycle(
@@ -149,7 +168,7 @@ def _cycle_account(session, account: Account, now: datetime, source, delay: int)
                 _notify(session, account.id, "INFO", "checkpoint_initialized", f"{symbol} の処理位置を {today[-1].isoformat()} に合わせました。過去足は売買しません。")
                 processed.append(f"{symbol}:anchor")
                 continue
-            pending = [bar for bar in due if bar > last]
+            pending = pending_expected(market, last, now, delay)
             if not pending:
                 continue
             window_start = pending[0]
@@ -161,24 +180,52 @@ def _cycle_account(session, account: Account, now: datetime, source, delay: int)
                 raise ProviderError(str(exc)) from exc
             usable = _accept_bars(session, fetched, now)
             by_time = {bar.timestamp: bar for bar in usable if bar.symbol == symbol and bar.market == market}
-            ready = [bar_start for bar_start in pending if bar_ready(bar_start, now, delay)]
-            for bar_start in ready:
+            contiguous: list[datetime] = []
+            first_missing: datetime | None = None
+            missing_count = 0
+            for bar_start in pending:
                 if by_time.get(bar_start) is None:
-                    _notify(session, account.id, "ERROR", "data_missing", f"{symbol} の {bar_start.isoformat()} が無いため処理を止めました。")
-                    raise ProviderError(f"missing bar {symbol} {bar_start.isoformat()}")
-            for bar_start in ready[:-1]:
-                _features(session, instruments[symbol], _history(session, instruments[symbol].id, bar_start), now)
-                _mark_checkpoint(session, account.id, market, symbol, bar_start)
-                processed.append(f"{symbol}:{bar_start.isoformat()}:backfill")
-            if ready:
-                bar_start = ready[-1]
+                    first_missing = bar_start
+                    missing_count = sum(1 for item in pending if item >= bar_start and by_time.get(item) is None)
+                    break
+                contiguous.append(bar_start)
+            for bar_start in contiguous:
                 history = _history(session, instruments[symbol].id, bar_start)
                 _features(session, instruments[symbol], history, now)
-                new_orders = _trade_bar(session, account, broker, portfolio, config, market, history, bar_start, instruments, now)
-                created_orders += new_orders
+                allow_signal = first_missing is None and bar_start == pending[-1]
+                created_orders += _trade_bar(
+                    session,
+                    account,
+                    broker,
+                    portfolio,
+                    config,
+                    market,
+                    history,
+                    bar_start,
+                    instruments,
+                    now,
+                    signals=allow_signal,
+                )
                 _mark_checkpoint(session, account.id, market, symbol, bar_start)
                 _snapshot(session, account.id, portfolio, broker, bar_start)
-                processed.append(f"{symbol}:{bar_start.isoformat()}")
+                processed.append(f"{symbol}:{bar_start.isoformat()}" if allow_signal else f"{symbol}:{bar_start.isoformat()}:manage")
+            if first_missing is not None:
+                _notify_exact(
+                    session,
+                    account.id,
+                    "WARNING",
+                    "data_gap",
+                    f"{symbol} の {first_missing.isoformat()} が欠足です。価格は補完せず、この足より後は処理しません。",
+                )
+                if missing_count > 3:
+                    _notify_exact(
+                        session,
+                        account.id,
+                        "ERROR",
+                        "risk_unobservable",
+                        f"{symbol} の期待足が {missing_count} 本欠けています。最初の欠足は {first_missing.isoformat()} です。新規買いは停止します。",
+                    )
+                processed.append(f"{symbol}:gap")
     _sync(session, account, broker, instruments, now)
     _reconcile(session, account.id, portfolio)
     if not processed:
@@ -186,8 +233,9 @@ def _cycle_account(session, account: Account, now: datetime, source, delay: int)
     return CycleResult("SUCCEEDED", None, processed, created_orders)
 
 
-def _trade_bar(session, account, broker: SimulatedBroker, portfolio: Portfolio, config, market, history, bar_start, instruments, received_at) -> int:
+def _trade_bar(session, account, broker: SimulatedBroker, portfolio: Portfolio, config, market, history, bar_start, instruments, received_at, *, signals: bool = True) -> int:
     bar = history[-1]
+    prior = _protection_at_bar_start(portfolio, bar.symbol)
     for order in list(broker.orders.values()):
         if order.symbol != bar.symbol or order.status not in {"SUBMITTED", "PARTIALLY_FILLED"}:
             continue
@@ -210,8 +258,11 @@ def _trade_bar(session, account, broker: SimulatedBroker, portfolio: Portfolio, 
         execution = broker.fill_observed(order, bar, quote.price, quote.reference, quote.observed_at)
         if execution is not None:
             _notify(session, account.id, "INFO", "order_filled", f"{order.symbol} を {quote.price} で約定しました。")
-    _protect(session, account, broker, portfolio, bar, received_at)
+    if prior is not None:
+        _protect(session, account, broker, portfolio, bar, received_at, prior[0], prior[1])
     portfolio.mark(bar.symbol, bar.close)
+    if not signals:
+        return 0
     engine = _engine(session, account)
     choice = "CASH"
     reason = "no_new_entry"
@@ -297,6 +348,8 @@ def _submit_exit(session, account, broker, portfolio, signal, bar, received_at) 
     position = portfolio.positions.get(signal.symbol)
     if position is None or not position.is_open:
         return "CASH", "no_open_position"
+    if _pending_sell(broker, signal.symbol):
+        return "CASH", "position_or_order_exists"
     key = _order_key(account.id, signal.symbol, signal.timestamp, "SELL")
     if broker._by_key.get(key) is not None or session.scalar(select(OrderRecord.id).where(OrderRecord.idempotency_key == key)) is not None:
         return "CASH", "duplicate_order"
@@ -321,14 +374,22 @@ def _submit_exit(session, account, broker, portfolio, signal, bar, received_at) 
     return "CASH", signal.reason
 
 
-def _protect(session, account, broker, portfolio, bar, received_at) -> None:
+def _protection_at_bar_start(portfolio: Portfolio, symbol: str) -> tuple[Decimal | None, Decimal | None] | None:
+    """Protection prices from before this bar's fills. A position opened by this bar has none."""
+    position = portfolio.positions.get(symbol)
+    if position is None or not position.is_open:
+        return None
+    return (position.stop_price, position.take_profit)
+
+
+def _protect(session, account, broker, portfolio, bar, received_at, stop_price: Decimal | None, take_profit: Decimal | None) -> None:
     position = portfolio.positions.get(bar.symbol)
     if position is None or not position.is_open:
         return
     if _pending_sell(broker, bar.symbol):
         return
-    hit_stop = position.stop_price is not None and bar.low <= position.stop_price
-    hit_target = position.take_profit is not None and bar.high >= position.take_profit
+    hit_stop = stop_price is not None and bar.low <= stop_price
+    hit_target = take_profit is not None and bar.high >= take_profit
     if not hit_stop and not hit_target:
         return
     from app.trading.strategies import Signal
@@ -548,6 +609,12 @@ def _sync(session, account, broker: SimulatedBroker, instruments, now: datetime)
             )
         )
     for entry in broker.portfolio.ledger:
+        if entry.idempotency_key is not None:
+            existing = session.scalar(
+                select(CashLedgerEntry.id).where(CashLedgerEntry.idempotency_key == entry.idempotency_key)
+            )
+            if existing is not None:
+                continue
         session.add(
             CashLedgerEntry(
                 account_id=account.id,
@@ -555,6 +622,7 @@ def _sync(session, account, broker: SimulatedBroker, instruments, now: datetime)
                 amount=entry.amount,
                 balance_after=entry.balance_after,
                 reason=entry.reason,
+                idempotency_key=entry.idempotency_key,
                 created_at=entry.created_at,
             )
         )
@@ -834,6 +902,19 @@ def _ensure_session(session, account, now: datetime) -> None:
             )
         )
         session.flush()
+
+
+def _notify_exact(session, account_id: int | None, level: str, code: str, message: str) -> None:
+    existing = session.scalar(
+        select(NotificationEvent.id).where(
+            NotificationEvent.account_id == account_id,
+            NotificationEvent.code == code,
+            NotificationEvent.message == message,
+        )
+    )
+    if existing is not None:
+        return
+    _notify(session, account_id, level, code, message)
 
 
 def _notify(session, account_id: int | None, level: str, code: str, message: str) -> None:
